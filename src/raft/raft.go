@@ -23,7 +23,6 @@ import (
 	//"log"
 	"time"
 	"math/rand"
-	//"math"
 )
 
 // import "bytes"
@@ -53,7 +52,6 @@ type ApplyMsg struct {
 type Log struct {
 	Commond		interface{}
 	Term 		int
-	Index 		int
 }
 
 type Raft struct {
@@ -149,30 +147,35 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	rf.requestVoteCH <- true
 	if rf.currentTerm > args.Term {
 		// Reply false if term < currentTerm
 		rf.replyRequestVoteNo(args, reply)
+		DPrintf("#%d reject candidate #%d, term %d>%d",
+			rf.me, args.CandidateId, rf.currentTerm, args.Term)
 	} else {
-		if rf.currentTerm < args.Term{
-			rf.replyRequestVoteYes(args, reply)
-			rf.checkTerm(args.CandidateId, args.Term)
+		if rf.currentTerm < args.Term {
+			//DPrintf("#%d'term(%d) < #%d'term(%d)",
+			//	rf.me, rf.currentTerm, args.CandidateId, args.Term)
+			rf.currentTerm = args.Term
+			rf.votedFor = -1
+			rf.status = STATUS_FOLLOWER
+		}
+		//rf.checkTerm(args.CandidateId, args.Term)
+		isUpToDate := false
+		if len(rf.log) > 0 {
+			lastIdx := len(rf.log)-1
+			lastTerm := rf.log[lastIdx].Term
+			//DPrintf("%d?%d, %d?%d", lastTerm, args.LastLogTerm, lastIdx, args.LastLogIndex)
+			if lastTerm < args.LastLogTerm || (lastTerm == args.LastLogTerm && lastIdx <= args.LastLogIndex) {
+				isUpToDate = true
+			}
 		} else {
-			isUpToDate := true
-			if len(rf.log) > 0 {
-				lastIdx := rf.log[len(rf.log)-1].Index
-				lastTerm := rf.log[len(rf.log)-1].Term
-				if lastTerm < args.LastLogTerm || (lastTerm == args.LastLogTerm && lastIdx < args.LastLogIndex) {
-					isUpToDate = true
-				} else {
-					isUpToDate = false
-				}
-			}
-			if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && isUpToDate {
-				rf.replyRequestVoteYes(args, reply)
-			} else {
-				rf.replyRequestVoteNo(args, reply)
-			}
+			isUpToDate = true
+		}
+		if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && isUpToDate {
+			rf.replyRequestVoteYes(args, reply)
+		} else {
+			rf.replyRequestVoteNo(args, reply)
 		}
 	}
 }
@@ -220,7 +223,7 @@ func (rf *Raft) broadcastRequestVote() {
 		LastLogTerm: -1,
 	}
 	if lastLogIndex >= 0 {
-		args.LastLogIndex = rf.log[lastLogIndex].Index
+		args.LastLogIndex = lastLogIndex
 		args.LastLogTerm = rf.log[lastLogIndex].Term
 	}
 
@@ -240,7 +243,13 @@ func (rf *Raft) broadcastRequestVote() {
 							isAlreadyLeader = true
 						}
 					}
-					rf.checkTerm(i, reply.Term)
+					if rf.currentTerm < reply.Term {
+						DPrintf("#%d candidate -> follower, term(%d) < vote request reply'term(%d)",
+							rf.me, rf.currentTerm, reply.Term)
+						rf.currentTerm = reply.Term
+						rf.votedFor = -1
+						rf.status = STATUS_FOLLOWER
+					}
 				}
 			}(i)
 		}
@@ -279,7 +288,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			//DPrintf("Leader #%d update index to %d", rf.me, index)
 			rf.nextIndex[rf.me] = index
 			rf.mu.Unlock()
-			DPrintf("Leader #%d receive a command, log len=%d", rf.me, len(rf.log))
+			DPrintf("Leader #%d receive a command=%d, len(log)=%d", rf.me, command, len(rf.log))
 
 			rf.broadcastAppendEntries()
 		//}()
@@ -334,7 +343,7 @@ func (rf *Raft) Candidate() {
 			rf.nextIndex = []int{}
 			rf.matchIndex = []int{}
 			for i := 0; i < len(rf.peers); i++ {
-				rf.nextIndex = append(rf.nextIndex, -1)
+				rf.nextIndex = append(rf.nextIndex, len(rf.log)-1)
 				rf.matchIndex = append(rf.matchIndex, 0)
 			}
 			rf.mu.Unlock()
@@ -347,19 +356,19 @@ func (rf *Raft) Candidate() {
 	case <- rf.requestVoteCH:
 	case <- rf.lowerTermCH:
 		rf.mu.Lock()
-		DPrintf("#%d candidate -> follower", rf.me)
+		DPrintf("#%d candidate -> follower for lower term", rf.me)
 		rf.status = STATUS_FOLLOWER
 		rf.mu.Unlock()
 	}
 }
 
 func (rf *Raft) Follower() {
-	timeout := rand.Intn(300) + 800
+	timeout := rand.Intn(300) + 500
 	//DPrintf("follower #%d start loop", rf.me)
 	select {
 	case <- rf.appendEntryCH:
 		//DPrintf("#%d in select case heartbeat", rf.me)
-	case <- rf.lowerTermCH:
+	//case <- rf.lowerTermCH:
 	case <- rf.requestVoteCH:
 	case <- time.After(time.Duration(timeout) * time.Millisecond):
 		rf.mu.Lock()
@@ -382,22 +391,40 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term 			int
 	Success			bool
+	NextIndex		int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.appendEntryCH <- true
 	// Reply false if term < currentTerm
 	if rf.currentTerm > args.Term {
 		rf.replyAppendEntriesNo(args, reply)
 	} else {
 		if rf.currentTerm < args.Term {
 			rf.replyAppendEntriesYes(args, reply)
-			rf.checkTerm(args.LeaderId, args.Term)
+			//rf.checkTerm(args.LeaderId, args.Term)
+			if rf.currentTerm < args.Term {
+				DPrintf("#%d term(%d) < Leader #%d'term(%d)",
+					rf.me, rf.currentTerm, args.LeaderId, args.Term)
+				rf.currentTerm = args.Term
+				rf.votedFor = -1
+				rf.status = STATUS_FOLLOWER
+			}
 		} else {
 			// Reply false if log doesn’t contain an entry at prevLogIndex
 			// whose term matches prevLogTerm
 			if args.PreLogIndex >= 0 && (len(rf.log) <= args.PreLogIndex ||
 				(len(rf.log) > args.PreLogIndex && rf.log[args.PreLogIndex].Term != args.PreLogTerm)) {
+				if args.PreLogIndex < len(rf.log) {
+					tmp := args.PreLogIndex
+					//fmt.Printf("%d\n", tmp)
+					for tmp >= 0 && rf.log[tmp].Term != args.PreLogTerm {
+						tmp--
+						//fmt.Printf("%d\n", tmp)
+					}
+					reply.NextIndex = tmp
+				} else {
+					reply.NextIndex = 0
+				}
 				rf.replyAppendEntriesNo(args, reply)
 			} else {
 				rf.replyAppendEntriesYes(args, reply)
@@ -423,7 +450,7 @@ func (rf *Raft) broadcastAppendEntries() {
 				//Entries: rf.log[rf.nextIndex[i]+1:],
 				LeaderCommit: rf.commitIndex,
 			}
-			//DPrintf("%d, %d", len(rf.log), rf.nextIndex[i])
+			//fmt.Printf("%d, %d", len(rf.log), rf.nextIndex[i])
 			args.PreLogIndex = rf.nextIndex[i]
 			if rf.nextIndex[i] == -1 {
 				args.PreLogTerm = 0
@@ -441,11 +468,12 @@ func (rf *Raft) broadcastAppendEntries() {
 					rf.checkTerm(i, reply.Term)
 					if len(args.Entries) > 0 {
 						if reply.Success {
+							//rf.nextIndex[i]++
+							rf.nextIndex[i] = reply.NextIndex
 							rf.matchIndex[i] = max(rf.matchIndex[i], rf.nextIndex[i])
-							rf.nextIndex[i]++
 						} else {
 							if rf.nextIndex[i] > 0 {
-								rf.nextIndex[i]--
+								rf.nextIndex[i] = reply.NextIndex
 							}
 						}
 					}
@@ -487,6 +515,7 @@ func (rf *Raft) setTerm(term int) {
 
 
 func (rf *Raft) replyRequestVoteYes(args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.requestVoteCH <- true
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = true
 	rf.mu.Lock()
@@ -499,34 +528,47 @@ func (rf *Raft) replyRequestVoteYes(args *RequestVoteArgs, reply *RequestVoteRep
 func (rf *Raft) replyRequestVoteNo(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
-	DPrintf("#%d reject candidate #%d",
-		rf.me, args.CandidateId)
+	//DPrintf("#%d reject candidate #%d",
+	//	rf.me, args.CandidateId)
 }
 
 func (rf *Raft) replyAppendEntriesYes(args *AppendEntriesArgs, reply *AppendEntriesReply)  {
+	rf.appendEntryCH <- true
 	reply.Success = true
 	reply.Term = rf.currentTerm
 
-	rf.mu.Lock()
-	rf.log = rf.log[:args.PreLogIndex+1]
+	isConflict := false
 	for i := 0; i < len(args.Entries); i++ {
-		rf.log = append(rf.log, args.Entries[i])
+		tmpIdx := args.PreLogIndex +1+i
+		if tmpIdx >= len(rf.log) || rf.log[tmpIdx] != args.Entries[i] {
+			isConflict = true
+		}
+	}
+	if isConflict {
+		rf.mu.Lock()
+		rf.log = rf.log[:args.PreLogIndex+1]
+		for i := 0; i < len(args.Entries); i++ {
+			rf.log = append(rf.log, args.Entries[i])
+		}
+		rf.mu.Unlock()
+		//DPrintf("#%d accept append entries request from #%d," +
+		//	" len([]log)=%d, commitIndex=%d", rf.me, args.LeaderId, len(rf.log), rf.commitIndex)
 	}
 
+	reply.NextIndex = len(rf.log)-1
+	rf.mu.Lock()
 	rf.votedFor = args.LeaderId
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 	}
 	rf.mu.Unlock()
 
-	DPrintf("#%d accept append entries request from #%d," +
-		" len([]log)=%d, commitIndex=%d", rf.me, args.LeaderId, len(rf.log), rf.commitIndex)
 }
 
 func (rf *Raft) replyAppendEntriesNo(args *AppendEntriesArgs, reply *AppendEntriesReply)  {
 	reply.Success = false
 	reply.Term = rf.currentTerm
-	DPrintf("#%d reject append entries request from #%d", rf.me, args.LeaderId)
+	//DPrintf("#%d reject append entries request from #%d", rf.me, args.LeaderId)
 }
 
 //
@@ -559,7 +601,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = []int{}
 	rf.matchIndex = []int{}
 	for i := 0; i < len(rf.peers); i++ {
-		rf.nextIndex = append(rf.nextIndex, -1)
+		rf.nextIndex = append(rf.nextIndex, len(rf.log)-1)
 		rf.matchIndex = append(rf.matchIndex, 0)
 	}
 
@@ -576,19 +618,35 @@ func (rf *Raft) feedStateMachine(applyCh chan ApplyMsg) {
 	for {
 		rf.mu.Lock()
 		if rf.status == STATUS_LEADER {
-			newCommit := rf.commitIndex
-			cnt := 0
-			for i := 0; i < len(rf.nextIndex); i++ {
-				if rf.nextIndex[i] > rf.commitIndex {
-					cnt ++
-					if newCommit == rf.commitIndex || newCommit > rf.nextIndex[i] {
-						newCommit = rf.nextIndex[i]
+			N := rf.commitIndex
+			for i := rf.commitIndex + 1; i <= len(rf.log) - 1; i++ {
+				num := 1
+				for j := range rf.peers {
+					if j != rf.me && rf.matchIndex[j] >= i && rf.log[i].Term == rf.currentTerm {
+						num++
 					}
 				}
+				if 2*num > len(rf.peers) {
+					N = i
+				}
 			}
-			if cnt > len(rf.peers)/2 && rf.status == STATUS_LEADER {
-				rf.commitIndex = newCommit
+			if N != rf.commitIndex {
+				//DPrintf("Leader #%d commitIndex: %d -> %d", rf.me, rf.commitIndex, N)
+				rf.commitIndex = N
 			}
+			//newCommit := rf.commitIndex
+			//cnt := 0
+			//for i := 0; i < len(rf.nextIndex); i++ {
+			//	if rf.nextIndex[i] > rf.commitIndex {
+			//		cnt ++
+			//		if newCommit == rf.commitIndex || newCommit > rf.nextIndex[i] {
+			//			newCommit = rf.nextIndex[i]
+			//		}
+			//	}
+			//}
+			//if cnt > len(rf.peers)/2 && rf.status == STATUS_LEADER {
+			//	rf.commitIndex = newCommit
+			//}
 		}
 		rf.mu.Unlock()
 		time.Sleep(30 * time.Millisecond)
