@@ -23,6 +23,8 @@ import (
 	//"log"
 	"time"
 	"math/rand"
+	"bytes"
+	"encoding/gob"
 )
 
 // import "bytes"
@@ -74,7 +76,6 @@ type Raft struct {
 	voteNum        int
 	appendEntryCH  chan bool
 	becomeLeaderCH chan bool
-	lowerTermCH    chan bool
 	requestVoteCH  chan bool
 }
 
@@ -95,26 +96,26 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := gob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := gob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
-	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := gob.NewDecoder(r)
-	// d.Decode(&rf.xxx)
-	// d.Decode(&rf.yyy)
+	r := bytes.NewBuffer(data)
+	d := gob.NewDecoder(r)
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.log)
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -147,6 +148,9 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.persist()
 	if rf.currentTerm > args.Term {
 		// Reply false if term < currentTerm
 		rf.replyRequestVoteNo(args, reply)
@@ -215,6 +219,9 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) broadcastRequestVote() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.persist()
 	lastLogIndex := len(rf.log)-1
 	args := RequestVoteArgs{
 		Term: rf.currentTerm,
@@ -235,9 +242,7 @@ func (rf *Raft) broadcastRequestVote() {
 				ok := rf.sendRequestVote(i, &args, &reply)
 				if ok {
 					if reply.VoteGranted {
-						rf.mu.Lock()
 						rf.voteNum++
-						rf.mu.Unlock()
 						if rf.voteNum > len(rf.peers)/2 && !isAlreadyLeader {
 							rf.becomeLeaderCH <- true
 							isAlreadyLeader = true
@@ -247,6 +252,7 @@ func (rf *Raft) broadcastRequestVote() {
 						DPrintf("#%d candidate -> follower, term(%d) < vote request reply'term(%d)",
 							rf.me, rf.currentTerm, reply.Term)
 						rf.currentTerm = reply.Term
+						rf.votedFor = -1
 						rf.votedFor = -1
 						rf.status = STATUS_FOLLOWER
 					}
@@ -270,6 +276,8 @@ func (rf *Raft) broadcastRequestVote() {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	index := rf.commitIndex
 	term := rf.currentTerm
 	var isLeader bool
@@ -282,14 +290,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 				Term: 	rf.currentTerm,
 			}
 
-			rf.mu.Lock()
 			rf.log = append(rf.log, entry)
 			index = len(rf.log) - 1
 			//DPrintf("Leader #%d update index to %d", rf.me, index)
 			rf.nextIndex[rf.me] = index
-			rf.mu.Unlock()
-			DPrintf("Leader #%d receive a command=%d, len(log)=%d", rf.me, command, len(rf.log))
-
+			DPrintf("Leader #%d receive a command=%d, term=%d, len(log)=%d",
+				rf.me, command, rf.currentTerm, len(rf.log))
+			rf.persist()
 			rf.broadcastAppendEntries()
 		//}()
 	} else {
@@ -323,6 +330,7 @@ func (rf *Raft) Loop() {
 }
 
 func (rf *Raft) Candidate() {
+	defer rf.persist()
 	timeout := rand.Intn(150) + 150
 
 	rf.mu.Lock()
@@ -354,15 +362,11 @@ func (rf *Raft) Candidate() {
 		rf.status = STATUS_FOLLOWER
 		rf.mu.Unlock()
 	case <- rf.requestVoteCH:
-	case <- rf.lowerTermCH:
-		rf.mu.Lock()
-		DPrintf("#%d candidate -> follower for lower term", rf.me)
-		rf.status = STATUS_FOLLOWER
-		rf.mu.Unlock()
 	}
 }
 
 func (rf *Raft) Follower() {
+	defer rf.persist()
 	timeout := rand.Intn(300) + 500
 	//DPrintf("follower #%d start loop", rf.me)
 	select {
@@ -399,8 +403,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if rf.currentTerm > args.Term {
 		rf.replyAppendEntriesNo(args, reply)
 	} else {
-		if rf.currentTerm < args.Term {
-			rf.replyAppendEntriesYes(args, reply)
+		//if rf.currentTerm < args.Term {
 			//rf.checkTerm(args.LeaderId, args.Term)
 			if rf.currentTerm < args.Term {
 				DPrintf("#%d term(%d) < Leader #%d'term(%d)",
@@ -409,7 +412,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				rf.votedFor = -1
 				rf.status = STATUS_FOLLOWER
 			}
-		} else {
+			//rf.replyAppendEntriesYes(args, reply)
+		//} else {
 			// Reply false if log doesn’t contain an entry at prevLogIndex
 			// whose term matches prevLogTerm
 			if args.PreLogIndex >= 0 && (len(rf.log) <= args.PreLogIndex ||
@@ -429,7 +433,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			} else {
 				rf.replyAppendEntriesYes(args, reply)
 			}
-		}
+		//}
 
 	}
 }
@@ -465,7 +469,12 @@ func (rf *Raft) broadcastAppendEntries() {
 			go func(i int) {
 				ok := rf.sendAppendEntries(i, &args, &reply)
 				if ok {
-					rf.checkTerm(i, reply.Term)
+					//rf.checkTerm(i, reply.Term)
+					if rf.currentTerm < reply.Term {
+						rf.currentTerm = reply.Term
+						rf.status = STATUS_FOLLOWER
+						rf.votedFor = -1
+					}
 					if len(args.Entries) > 0 {
 						if reply.Success {
 							//rf.nextIndex[i]++
@@ -485,44 +494,21 @@ func (rf *Raft) broadcastAppendEntries() {
 
 
 func (rf *Raft) Leader() {
+	defer rf.persist()
 	rf.broadcastAppendEntries()
 
 	select {
-	case <-rf.lowerTermCH:
-		rf.mu.Lock()
-		DPrintf("No.%d leader to follower for lower term", rf.me)
-		rf.status = STATUS_FOLLOWER
-		rf.mu.Unlock()
 	case <-time.After(150 * time.Millisecond):
 	}
 }
-
-func (rf *Raft) checkTerm(id int, term int) {
-	if rf.currentTerm < term {
-		rf.lowerTermCH <- true
-		//DPrintf("#%d and #%d term: %d < %d", rf.me, id, rf.currentTerm, term)
-		rf.setTerm(term)
-	}
-}
-
-func (rf *Raft) setTerm(term int) {
-	rf.mu.Lock()
-	rf.currentTerm = term
-	rf.votedFor = -1
-	rf.voteNum = 0
-	rf.mu.Unlock()
-}
-
 
 func (rf *Raft) replyRequestVoteYes(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.requestVoteCH <- true
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = true
-	rf.mu.Lock()
-	DPrintf("#%d vote #%d in term %d, previous vote for %d",
-		rf.me, args.CandidateId, rf.currentTerm, rf.votedFor)
+	//DPrintf("#%d vote #%d in term %d, previous vote for %d",
+	//	rf.me, args.CandidateId, rf.currentTerm, rf.votedFor)
 	rf.votedFor = args.CandidateId
-	rf.mu.Unlock()
 }
 
 func (rf *Raft) replyRequestVoteNo(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -545,30 +531,25 @@ func (rf *Raft) replyAppendEntriesYes(args *AppendEntriesArgs, reply *AppendEntr
 		}
 	}
 	if isConflict {
-		rf.mu.Lock()
 		rf.log = rf.log[:args.PreLogIndex+1]
 		for i := 0; i < len(args.Entries); i++ {
 			rf.log = append(rf.log, args.Entries[i])
 		}
-		rf.mu.Unlock()
-		//DPrintf("#%d accept append entries request from #%d," +
-		//	" len([]log)=%d, commitIndex=%d", rf.me, args.LeaderId, len(rf.log), rf.commitIndex)
+		DPrintf("#%d accept append entries request from #%d," +
+			" len([]log)=%d, commitIndex=%d", rf.me, args.LeaderId, len(rf.log), rf.commitIndex)
 	}
 
 	reply.NextIndex = len(rf.log)-1
-	rf.mu.Lock()
 	rf.votedFor = args.LeaderId
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 	}
-	rf.mu.Unlock()
-
 }
 
 func (rf *Raft) replyAppendEntriesNo(args *AppendEntriesArgs, reply *AppendEntriesReply)  {
 	reply.Success = false
 	reply.Term = rf.currentTerm
-	//DPrintf("#%d reject append entries request from #%d", rf.me, args.LeaderId)
+	DPrintf("#%d reject append entries request from #%d", rf.me, args.LeaderId)
 }
 
 //
@@ -595,7 +576,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.appendEntryCH = make(chan bool)
 	rf.becomeLeaderCH = make(chan bool)
-	rf.lowerTermCH = make(chan bool)
 	rf.requestVoteCH = make(chan bool)
 	rf.log = []Log{}
 	rf.nextIndex = []int{}
@@ -673,16 +653,3 @@ func (rf *Raft) feedStateMachine(applyCh chan ApplyMsg) {
 	}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a, b int) int {
-	if a < b {
-		return b
-	}
-	return a
-}
