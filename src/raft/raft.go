@@ -158,13 +158,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.me, args.CandidateId, rf.currentTerm, args.Term)
 	} else {
 		if rf.currentTerm < args.Term {
-			//DPrintf("#%d'term(%d) < #%d'term(%d)",
-			//	rf.me, rf.currentTerm, args.CandidateId, args.Term)
+			if rf.status != STATUS_FOLLOWER {
+				DPrintf("#%d -> follower, term(%d) < #%d'term(%d)",
+					rf.me, rf.currentTerm, args.CandidateId, args.Term)
+			}
 			rf.currentTerm = args.Term
 			rf.votedFor = -1
 			rf.status = STATUS_FOLLOWER
 		}
-		//rf.checkTerm(args.CandidateId, args.Term)
 		isUpToDate := false
 		if len(rf.log) > 0 {
 			lastIdx := len(rf.log)-1
@@ -278,6 +279,7 @@ func (rf *Raft) broadcastRequestVote() {
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 	index := rf.commitIndex
 	term := rf.currentTerm
 	var isLeader bool
@@ -399,6 +401,9 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.persist()
 	// Reply false if term < currentTerm
 	if rf.currentTerm > args.Term {
 		rf.replyAppendEntriesNo(args, reply)
@@ -406,8 +411,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//if rf.currentTerm < args.Term {
 			//rf.checkTerm(args.LeaderId, args.Term)
 			if rf.currentTerm < args.Term {
-				DPrintf("#%d term(%d) < Leader #%d'term(%d)",
-					rf.me, rf.currentTerm, args.LeaderId, args.Term)
+				if rf.status != STATUS_FOLLOWER {
+					DPrintf("#%d -> follower, term(%d) < Leader #%d'term(%d)",
+						rf.me, rf.currentTerm, args.LeaderId, args.Term)
+				}
 				rf.currentTerm = args.Term
 				rf.votedFor = -1
 				rf.status = STATUS_FOLLOWER
@@ -471,6 +478,8 @@ func (rf *Raft) broadcastAppendEntries() {
 				if ok {
 					//rf.checkTerm(i, reply.Term)
 					if rf.currentTerm < reply.Term {
+						DPrintf("#%d -> follower, term(%d) < reply'term(%d)",
+							rf.me, rf.currentTerm, args.Term)
 						rf.currentTerm = reply.Term
 						rf.status = STATUS_FOLLOWER
 						rf.votedFor = -1
@@ -629,6 +638,7 @@ func (rf *Raft) feedStateMachine(applyCh chan ApplyMsg) {
 			//}
 		}
 		rf.mu.Unlock()
+		rf.persist()
 		time.Sleep(30 * time.Millisecond)
 		if rf.lastApplied < rf.commitIndex {
 			go func() {
@@ -637,6 +647,7 @@ func (rf *Raft) feedStateMachine(applyCh chan ApplyMsg) {
 				commitIdx := rf.commitIndex
 				rf.lastApplied = commitIdx
 				rf.mu.Unlock()
+				rf.persist()
 				if len(rf.log) - 1 < commitIdx {
 					return
 				}
